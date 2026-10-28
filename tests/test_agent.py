@@ -417,3 +417,36 @@ def test_agent_reports_missing_repository():
     assert report["failure"]["type"] == "ValueError"
     assert report["failure"]["stage"] == "OBSERVE"
     assert report["failure"]["traceback"]
+
+
+def test_agent_records_decision_metadata_on_keep(tmp_path, monkeypatch, sample_repo):
+    """The decision layer must be visible in the report, not just its status."""
+    repo, _ = sample_repo
+    monkeypatch.setattr("app.tools.run_pytest", fake_tests(True))
+    agent = Agent(llm=FakeLLM(payload(OPTIMIZED)), benchmark_size=300, benchmark_repeats=2)
+
+    report = agent.run(repo, max_iterations=1)
+
+    verification = report["iterations"][0]["verification"]
+    assert verification["status"] == "kept"
+    assert verification["action"] == "KEEP"
+    assert verification["confidence"] == "HIGH"
+    levels = {item["level"]: item for item in verification["evidence"]}
+    # Repository tests, framework tests, differential outputs, benchmark and
+    # static safety were all evaluated and satisfied.
+    assert {1, 2, 4, 6, 7} <= set(levels)
+    assert all(levels[level]["satisfied"] for level in (1, 2, 4, 6, 7))
+
+
+def test_agent_records_decision_metadata_on_revert(tmp_path, monkeypatch, membership_repo):
+    repo, _ = membership_repo
+    monkeypatch.setattr("app.tools.run_pytest", fake_tests(True))
+    agent = Agent(llm=FakeLLM(payload(SLOWER_HAS_DUPES)), benchmark_size=300, benchmark_repeats=2)
+
+    report = agent.run(repo, max_iterations=1)
+
+    verification = report["iterations"][0]["verification"]
+    assert verification["status"] == "reverted"
+    assert verification["action"] == "REVERT"
+    assert verification["confidence"] == "HIGH"
+    assert any("below the required" in reason for reason in verification["reasons"])

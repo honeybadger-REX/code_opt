@@ -11,6 +11,15 @@ from typing import Any, Callable
 
 from .analyzer import ACTIONABLE_KINDS, analyze_repository, is_test_file, rank_findings
 from .benchmark import infer_params
+from .decision import (
+    EXISTING_TESTS,
+    GENERATED_BEHAVIORAL_TESTS,
+    DecisionEngine,
+    reject_replacement,
+    reject_unexpected,
+    revert_no_change,
+    skip,
+)
 from .git_manager import Workspace, apply_to_original, create_workspace
 from .llm import LLMError, OpenCodeLLM, build_optimization_prompt, parse_json_object
 from .models import Finding, Proposal
@@ -277,6 +286,9 @@ class Agent:
                     "benchmark_repeats": self.benchmark_repeats,
                 }
             )
+            # The decision engine holds the acceptance threshold; every
+            # KEEP/REVERT/REJECT/SKIP decision in this run goes through it.
+            engine = DecisionEngine(self.min_improvement_pct)
 
             self._emit("OBSERVE", f"Repository: {source}")
             workspace = create_workspace(source, base_dir=self.workspace_base)
@@ -494,25 +506,12 @@ class Agent:
 
                 safety = assess_function_safety(file_source, function)
                 record["safety"] = safety
-                if not safety["safe"]:
-                    reason = (
-                        "candidate is not safe to execute with generated inputs: "
-                        + "; ".join(safety["reasons"])
-                    )
-                    record["verification"] = {"status": "rejected", "reasons": [reason]}
-                    report["iterations"].append(record)
-                    report["rejected"] += 1
-                    self._emit("VALIDATE", f"REJECTED '{function}': {reason}")
-                    continue
-                if (
-                    validation["strategy"] == "GENERATED_BEHAVIORAL_TESTS"
-                    and not safety["generated_possible"]
-                ):
-                    reason = (
-                        "candidate cannot be validated behaviourally: "
-                        f"{safety.get('input_error') or 'no safe generated inputs'}"
-                    )
-                    record["verification"] = {"status": "rejected", "reasons": [reason]}
+                safety_decision = engine.check_safety(safety, validation["strategy"])
+                if safety_decision is not None:
+                    # Nothing has been applied yet: the candidate itself is
+                    # refused without touching the workspace.
+                    reason = safety_decision.reasons[0]
+                    record["verification"] = safety_decision.to_verification()
                     report["iterations"].append(record)
                     report["rejected"] += 1
                     self._emit("VALIDATE", f"REJECTED '{function}': {reason}")
@@ -535,10 +534,9 @@ class Agent:
                     candidates.append(fallback)
 
                 if not candidates:
-                    record["verification"] = {
-                        "status": "skipped",
-                        "reasons": ["no valid proposal from the model or deterministic fallback"],
-                    }
+                    record["verification"] = skip(
+                        "no valid proposal from the model or deterministic fallback"
+                    ).to_verification()
                     report["iterations"].append(record)
                     report["skipped"] += 1
                     self._emit("PLAN", f"Skipping '{function}': no safe proposal")
@@ -572,13 +570,7 @@ class Agent:
                         try:
                             replace_function(path, function, candidate.source)
                         except OptimizationError as exc:
-                            attempt["verification"] = {
-                                "status": "rejected",
-                                "reasons": [
-                                    "candidate could not be safely validated: "
-                                    f"replacement rejected: {exc}"
-                                ],
-                            }
+                            attempt["verification"] = reject_replacement(str(exc)).to_verification()
                             attempt["exception"] = {
                                 "type": type(exc).__name__,
                                 "message": str(exc),
@@ -593,10 +585,7 @@ class Agent:
                         attempt["diff"] = diff
                         if not diff.strip():
                             tools.git_revert(file=finding.file)
-                            attempt["verification"] = {
-                                "status": "reverted",
-                                "reasons": ["proposal produced no code change"],
-                            }
+                            attempt["verification"] = revert_no_change().to_verification()
                             record["attempts"].append(attempt)
                             final_attempt = attempt
                             continue
@@ -605,7 +594,9 @@ class Agent:
                         )
 
                         self._set_stage(report, "VALIDATE")
-                        if validation["strategy"] == "EXISTING_TESTS":
+                        cases: list[dict[str, Any]] = []
+                        case_error: str | None = None
+                        if validation["strategy"] == EXISTING_TESTS:
                             if validation.get("runner") == "unittest":
                                 tests = tools.run_unittest(timeout=self.test_timeout)
                             else:
@@ -627,85 +618,54 @@ class Agent:
                                 f"Existing tests: {tests['passed_count']} passed, "
                                 f"{tests['failed_count']} failed, {tests['error_count']} errors",
                             )
-                            if not tests["ran"] or not tests["passed"]:
-                                tools.git_revert(file=finding.file)
-                                attempt["verification"] = {
-                                    "status": "reverted",
-                                    "reasons": [tests.get("reason") or "tests did not pass"],
-                                }
-                                record["attempts"].append(attempt)
-                                final_attempt = attempt
-                                self._emit("VERIFY", f"Reverted '{function}': tests failed")
-                                continue
+                            validation_decision = engine.check_validation(
+                                validation_strategy=EXISTING_TESTS,
+                                tests=tests,
+                                safety=safety,
+                            )
                         else:
                             cases, case_error = generate_cases(safety.get("params") or [])
-                            if case_error or not cases:
-                                tools.git_revert(file=finding.file)
-                                reason = (
-                                    "candidate could not be safely validated: "
-                                    f"{case_error or 'no generated cases were available'}"
-                                )
-                                attempt["verification"] = {
-                                    "status": "rejected",
-                                    "reasons": [reason],
-                                }
-                                record["attempts"].append(attempt)
-                                final_attempt = attempt
-                                self._emit("VERIFY", f"REJECTED '{function}': {reason}")
-                                continue
-                            behavior = tools.validate_behavior(
-                                function=function,
-                                baseline_source=file_source,
-                                optimized_path=finding.file,
+                            validation_decision = engine.check_generated_cases(
                                 cases=cases,
-                                timeout=min(self.test_timeout, 120.0),
+                                case_error=case_error,
+                                safety=safety,
                             )
-                            attempt["validation"] = behavior
-                            self._emit(
-                                "VALIDATE",
-                                f"Generated behavioural validation: "
-                                f"{behavior.get('cases_matched')}/{behavior.get('cases_total')} "
-                                f"cases matched",
-                            )
-                            if not behavior.get("ran"):
-                                tools.git_revert(file=finding.file)
-                                reason = (
-                                    "candidate could not be safely validated: "
-                                    f"behavioural validation did not run: "
-                                    f"{behavior.get('reason')}"
+                            if validation_decision is None:
+                                behavior = tools.validate_behavior(
+                                    function=function,
+                                    baseline_source=file_source,
+                                    optimized_path=finding.file,
+                                    cases=cases,
+                                    timeout=min(self.test_timeout, 120.0),
                                 )
-                                attempt["verification"] = {
-                                    "status": "rejected",
-                                    "reasons": [reason],
-                                }
-                                record["attempts"].append(attempt)
-                                final_attempt = attempt
-                                self._emit("VERIFY", f"REJECTED '{function}': {reason}")
-                                continue
-                            if not behavior.get("passed"):
-                                tools.git_revert(file=finding.file)
-                                reasons = [
-                                    behavior.get("reason")
-                                    or "behaviour differs from the original implementation"
-                                ]
-                                for mismatch in (behavior.get("mismatches") or [])[:3]:
-                                    reasons.append(
-                                        f"case {mismatch.get('case')}: {mismatch.get('reason')} "
-                                        f"(input {mismatch.get('input')}; original "
-                                        f"{mismatch.get('original')}; optimized "
-                                        f"{mismatch.get('optimized')})"
-                                    )
-                                attempt["verification"] = {
-                                    "status": "reverted",
-                                    "reasons": reasons,
-                                }
-                                record["attempts"].append(attempt)
-                                final_attempt = attempt
+                                attempt["validation"] = behavior
                                 self._emit(
-                                    "VERIFY",
-                                    f"Reverted '{function}': behavioural mismatch",
+                                    "VALIDATE",
+                                    f"Generated behavioural validation: "
+                                    f"{behavior.get('cases_matched')}/{behavior.get('cases_total')} "
+                                    f"cases matched",
                                 )
-                                continue
+                                validation_decision = engine.check_validation(
+                                    validation_strategy=GENERATED_BEHAVIORAL_TESTS,
+                                    cases=cases,
+                                    behavior=behavior,
+                                    safety=safety,
+                                )
+
+                        if validation_decision is not None:
+                            # The change is applied at this point, so any
+                            # evidence that does not support the candidate
+                            # means the workspace has to be restored first.
+                            tools.git_revert(file=finding.file)
+                            attempt["verification"] = validation_decision.to_verification()
+                            record["attempts"].append(attempt)
+                            final_attempt = attempt
+                            self._emit(
+                                "VERIFY",
+                                f"{validation_decision.status.upper()} '{function}': "
+                                + "; ".join(validation_decision.reasons[:2]),
+                            )
+                            continue
 
                         self._set_stage(report, "BENCHMARK")
                         try:
@@ -744,69 +704,31 @@ class Agent:
                         attempt["benchmark"] = bench
 
                         self._set_stage(report, "VERIFY")
-                        if not bench.get("available"):
-                            # The candidate cannot be measured, so it cannot be
-                            # validated.  This is a controlled rejection, not a
-                            # job crash and not a silent success.
+                        # Single gate: KEEP requires validation evidence plus a
+                        # measured, output-matching benchmark at or above the
+                        # configured threshold.  Anything else reverts or rejects.
+                        decision = engine.check_benchmark(
+                            bench,
+                            validation=attempt.get("validation"),
+                            safety=safety,
+                        )
+                        if not decision.kept:
                             tools.git_revert(file=finding.file)
-                            reason = (
-                                "candidate could not be safely validated: benchmark "
-                                f"unavailable: {bench.get('reason')}"
-                            )
-                            attempt["verification"] = {
-                                "status": "rejected",
-                                "reasons": [reason],
-                            }
+                            attempt["verification"] = decision.to_verification()
                             record["attempts"].append(attempt)
                             final_attempt = attempt
-                            self._emit("VERIFY", f"REJECTED '{function}': {reason}")
-                            continue
-
-                        reasons: list[str] = []
-                        if bench.get("outputs_match") is not True:
-                            reasons.append("benchmark outputs differ from the original implementation")
-                        improvement = bench.get("improvement_pct")
-                        if improvement is None:
-                            reasons.append("benchmark did not produce an improvement value")
-                        elif improvement < self.min_improvement_pct:
-                            reasons.append(
-                                f"improvement {improvement}% is below the required "
-                                f"{self.min_improvement_pct}%"
+                            self._emit(
+                                "VERIFY",
+                                f"{decision.status.upper()} '{function}': "
+                                + "; ".join(decision.reasons),
                             )
-
-                        if reasons:
-                            tools.git_revert(file=finding.file)
-                            attempt["verification"] = {"status": "reverted", "reasons": reasons}
-                            record["attempts"].append(attempt)
-                            final_attempt = attempt
-                            self._emit("VERIFY", f"Reverted '{function}': {'; '.join(reasons)}")
                             continue
 
                         commit = workspace.commit(
                             f"codeoptimizer: optimize {function} ({finding.kind})"
                         )
-                        validation_result = attempt.get("validation") or {}
-                        if validation_result.get("strategy") == "EXISTING_TESTS":
-                            validation_reason = (
-                                f"existing tests passed "
-                                f"({validation_result.get('cases_matched')} tests)"
-                            )
-                        else:
-                            validation_reason = (
-                                "generated behavioural validation matched "
-                                f"{validation_result.get('cases_matched')}/"
-                                f"{validation_result.get('cases_total')} cases "
-                                f"({validation_result.get('confidence')} confidence)"
-                            )
-                        attempt["verification"] = {
-                            "status": "kept",
-                            "reasons": [
-                                validation_reason,
-                                "outputs match on benchmark inputs",
-                                f"{bench['improvement_pct']}% faster (threshold {self.min_improvement_pct}%)",
-                            ],
-                            "commit": commit,
-                        }
+                        attempt["verification"] = decision.to_verification()
+                        attempt["verification"]["commit"] = commit
                         record["attempts"].append(attempt)
                         final_attempt = attempt
                         kept = True
@@ -820,16 +742,9 @@ class Agent:
                         # One bad candidate must not crash the whole job.  Revert
                         # the workspace and report the exact failure in the attempt.
                         revert_error = self._revert_candidate(tools, workspace, finding.file)
-                        reason = (
-                            "candidate could not be safely validated: "
-                            f"{type(exc).__name__}: {exc}"
-                        )
-                        if revert_error:
-                            reason += f"; automatic revert also failed: {revert_error}"
-                        attempt["verification"] = {
-                            "status": "rejected",
-                            "reasons": [reason],
-                        }
+                        attempt["verification"] = reject_unexpected(
+                            f"{type(exc).__name__}: {exc}", revert_error
+                        ).to_verification()
                         attempt["exception"] = {
                             "type": type(exc).__name__,
                             "message": str(exc),

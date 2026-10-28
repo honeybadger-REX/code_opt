@@ -98,16 +98,20 @@ def create_app(llm: Any | None = None) -> FastAPI:
                 on_update("ERROR", message, {"traceback": tb})
             except Exception:  # pragma: no cover - logging must never hide the failure
                 pass
-            store.update(job_id, status="aborted", stage=stage, error=message)
+            # The job runner itself crashed (infrastructure failure outside the
+            # agent's own guarded report path).  The agent reports its internal
+            # failures as "aborted"; a crash that escapes the runner is a
+            # "failed" job, which the API and UI already distinguish.
+            store.update(job_id, status="failed", stage=stage, error=message)
             current = store.get(job_id) or {}
             store.finish(
                 job_id,
                 {
                     "job_id": job_id,
                     "repo_path": repo_path,
-                    "status": "aborted",
+                    "status": "failed",
                     "stage": stage,
-                    "outcome": "aborted",
+                    "outcome": "failed",
                     "started_at": current.get("started_at"),
                     "finished_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                     "duration_seconds": None,

@@ -392,9 +392,18 @@ def run_unittest(repo_dir: Path, timeout: float = 300.0) -> TestResult:
     passed = ran and completed.returncode == 0 and "FAILED" not in output
     passed_count = max(0, total - failed - errors - skipped)
 
+    # Python 3.12+ exits with code 5 and prints "NO TESTS RAN" when discovery
+    # collects nothing.  That is the same situation as pytest's exit code 5:
+    # nothing was verified, which must be reported as "did not run" rather
+    # than as a discovery failure so the caller can fall back to generated
+    # behavioural validation instead of aborting.
+    no_tests = completed.returncode == 5 or "NO TESTS RAN" in output
+
     reason = None
     if not ran:
-        if completed.returncode != 0:
+        if no_tests:
+            reason = "no unittest tests were collected"
+        elif completed.returncode != 0:
             ran = True
             errors = max(errors, 1)
             passed = False

@@ -85,7 +85,30 @@ If tests fail, outputs differ, or the change is too small, the file is reverted
 reason is recorded. A candidate that cannot be validated at all (invalid
 replacement, benchmark unavailable, or an unexpected error while applying it)
 is marked `rejected`; the job continues and the exact exception/reason is kept in
-the report. The pytest runner ignores inherited `PYTEST_ADDOPTS`,
+the report.
+
+### Decision states
+
+Validation produces evidence; the `DecisionEngine` (`app/decision.py`) is the
+single place that turns evidence into an action, so the acceptance rules are
+auditable and unit-tested:
+
+| State | Meaning |
+| --- | --- |
+| `KEEP` | Validation passed **and** the benchmark measured both versions on the same inputs, outputs matched, and the improvement meets the threshold. |
+| `REVERT` | The change was applied but the evidence does not support it (failing tests, behavioural mismatch, outputs differ, improvement below threshold). |
+| `REJECT` | The candidate itself is unsafe, invalid, or unverifiable (failed safety checks, invalid replacement, missing validation or benchmark evidence). Nothing executable was proven. |
+| `SKIP` | No candidate existed to evaluate; nothing was applied. |
+| `ABORT` | Infrastructure/system failure prevented the workflow (job-level, never a candidate verdict). |
+
+Every attempt records `action`, `reasons`, `confidence` (`HIGH` for repository
+tests, `MEDIUM` for generated behavioural cases, `LOW`/`UNVERIFIED` otherwise),
+and an `evidence` list showing which validation-hierarchy levels (repository
+tests, framework tests, generated behavioural cases, differential outputs,
+edge-case inputs, benchmark measurement, static safety) were actually
+evaluated. Levels that were not evaluated are never claimed. The rules are
+fail-closed: no combination of missing evidence can produce `KEEP`.
+ The pytest runner ignores inherited `PYTEST_ADDOPTS`,
 `PYTEST_PLUGINS`, `PYTEST_DEBUG`, and `PYTEST_CURRENT_TEST` so the caller's
 session cannot accidentally deselect the verification tests.
 A failed model proposal is retried once, then the deterministic fallback is
@@ -102,8 +125,12 @@ code_optimizer/
 │   ├── main.py          FastAPI app, endpoints, background jobs
 │   ├── agent.py         OBSERVE..VERIFY loop, candidate attempts, reporting
 │   ├── analyzer.py      AST analysis: findings, complexity, duplicates, dead code
-│   ├── optimizer.py     validation, function replacement, deterministic rewrites
-│   ├── tester.py        pytest runner with structured results
+│   ├── optimizer.py     safe function replacement, deterministic rewrites
+│   ├── validation.py    repo discovery, safety assessment, generated cases,
+│   │                    differential behavioural validation
+│   ├── decision.py      DecisionEngine: KEEP/REVERT/REJECT/SKIP rules,
+│   │                    validation-hierarchy evidence, fail-closed invariants
+│   ├── tester.py        pytest/unittest runners with structured results
 │   ├── benchmark.py     isolated differential benchmark + input generation
 │   ├── git_manager.py   isolated workspace, diffs, commits, revert, apply
 │   ├── llm.py           OpenCode CLI adapter and prompt
@@ -116,8 +143,8 @@ code_optimizer/
 │   ├── inefficient.py   deliberately slow demo functions
 │   ├── test_inefficient.py  10 behavioral tests
 │   └── .codeoptimizer.json
-├── tests/               analyzer, optimizer, tester, benchmark, LLM, tools,
-│                        agent, git manager, API
+├── tests/               analyzer, optimizer, validation, decision, tester,
+│                        benchmark, LLM, tools, agent, git manager, API
 ├── requirements.txt
 ├── .env.example
 ├── run.py               CLI: serve | analyze | optimize | demo
@@ -222,7 +249,7 @@ be reverted.
 Command: `python -m pytest -q --color=no`
 
 ```
-84 passed in 64.44 s
+138 passed in 68.58 s
 ```
 
 The suite covers:
@@ -231,14 +258,22 @@ The suite covers:
   repeated computation, dead code, duplicate functions, parse errors, exclusions.
 - Optimizer safety: signature/name/decorator/docstring checks, banned calls and
   imports, method indentation, deterministic rewrites and their semantics.
-- Test runner: passing, failing, and no-tests-collected outcomes.
+- Validation engine: repository discovery (pytest/unittest/custom/none), safety
+  assessment, generated edge-case inputs, differential behavioural validation
+  (match and mismatch detection, float tolerance).
+- Decision engine: every decision state, fail-closed rules (no KEEP without
+  validation + matching benchmark ≥ threshold), confidence levels, and the
+  validation-hierarchy evidence records.
+- Test runner: passing, failing, no-tests-collected, and unittest discovery
+  outcomes (including Python 3.12's exit code 5).
 - Benchmark: improvement detection, wrong-output detection, input mutation
   rejection, annotation inference.
 - Git safety: isolated workspaces, excludes, snapshot fallback, diff/revert,
   apply-with-backup, cleanup.
 - Agent: keep, revert on test failure, revert when slower, LLM retry, fallback,
-  abort on failing/missing baseline tests, apply to original.
-- API: health, UI, tools, analyze, optimize job lifecycle, report, 404/400 paths.
+  abort on failing/missing baseline tests, apply to original, decision metadata.
+- API: health, UI, tools, analyze, optimize job lifecycle, report, 404/400 paths,
+  background job crash reporting.
 - LLM adapter: JSON parsing, CLI invocation, model flag, timeouts, errors.
 
 ## Benchmark methodology
