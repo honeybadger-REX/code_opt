@@ -126,6 +126,105 @@
     details summary { cursor: pointer; color: var(--muted); font-size: 12px; margin-top: 8px; }
     .kv { display: grid; grid-template-columns: 170px 1fr; gap: 6px 12px; font-size: 13px; }
     .kv .k { color: var(--muted); }
+    .banner {
+      background: rgba(110, 168, 254, 0.08);
+      border: 1px solid rgba(110, 168, 254, 0.25);
+      border-radius: 8px;
+      padding: 10px 14px;
+      font-size: 12.5px;
+      color: #b8d2fe;
+      margin-bottom: 14px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .file-item {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 12px 14px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--panel2);
+      margin-bottom: 8px;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+    .file-title {
+      font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+      font-size: 13px;
+      font-weight: 600;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .file-actions {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+    }
+    .btn-sm {
+      padding: 6px 12px;
+      font-size: 12px;
+      border-radius: 6px;
+    }
+    .modal-overlay {
+      position: fixed;
+      top: 0; left: 0; right: 0; bottom: 0;
+      background: rgba(0,0,0,0.75);
+      backdrop-filter: blur(4px);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      z-index: 1000;
+      padding: 20px;
+    }
+    .modal-card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      width: 100%;
+      max-width: 900px;
+      max-height: 85vh;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+    }
+    .modal-header {
+      padding: 14px 20px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .modal-body {
+      padding: 16px 20px;
+      overflow-y: auto;
+      flex: 1;
+    }
+    .tabs {
+      display: flex;
+      gap: 8px;
+      margin-bottom: 12px;
+    }
+    .tab-btn {
+      background: var(--panel2);
+      color: var(--muted);
+      border: 1px solid var(--border);
+      padding: 6px 12px;
+      font-size: 12px;
+      border-radius: 6px;
+      cursor: pointer;
+    }
+    .tab-btn.active {
+      background: var(--accent);
+      color: #08101f;
+      border-color: var(--accent);
+      font-weight: bold;
+    }
+    .diff-added { color: var(--green); }
+    .diff-deleted { color: var(--red); }
   </style>
 </head>
 <body>
@@ -185,6 +284,15 @@
     </table>
   </section>
 
+  <section class="panel" id="correctedFilesPanel" style="display:none">
+    <h2>Corrected files</h2>
+    <div class="banner">
+      <span>🛡️ <b>Changes are currently in an isolated workspace.</b> Review changes below. Only clicking <b>Import</b> explicitly updates the original repository.</span>
+    </div>
+    <div id="correctedFilesList"></div>
+    <div id="importNotice" style="margin-top:10px;"></div>
+  </section>
+
   <section class="panel" id="reportPanel" style="display:none">
     <h2>Optimization report</h2>
     <div id="reportSummary"></div>
@@ -203,6 +311,28 @@
     </details>
   </section>
 </main>
+
+<div id="previewModal" class="modal-overlay" style="display:none;">
+  <div class="modal-card">
+    <div class="modal-header">
+      <div>
+        <h3 style="margin:0; font-size:15px;" id="previewModalTitle">Diff Preview</h3>
+        <span class="muted" style="font-size:12px;" id="previewModalStats"></span>
+      </div>
+      <button class="secondary btn-sm" onclick="closePreviewModal()">&times; Close</button>
+    </div>
+    <div class="modal-body">
+      <div class="tabs">
+        <button id="tabDiffBtn" class="tab-btn active" onclick="switchPreviewTab('diff')">Unified Diff</button>
+        <button id="tabOptimizedBtn" class="tab-btn" onclick="switchPreviewTab('optimized')">Optimized Content</button>
+        <button id="tabOriginalBtn" class="tab-btn" onclick="switchPreviewTab('original')">Original Content</button>
+      </div>
+      <pre id="previewDiffView"></pre>
+      <pre id="previewOptimizedView" style="display:none;"></pre>
+      <pre id="previewOriginalView" style="display:none;"></pre>
+    </div>
+  </div>
+</div>
 
 <script>
 const $ = (id) => document.getElementById(id);
@@ -286,6 +416,7 @@ async function optimize() {
   btn.disabled = true;
   $("statusLine").textContent = "Starting agent...";
   $("reportPanel").style.display = "none";
+  $("correctedFilesPanel").style.display = "none";
   try {
     const response = await fetch("/optimize", {
       method: "POST",
@@ -460,6 +591,122 @@ function renderReport(report) {
   $("finalDiff").textContent = report.final_diff || "(no changes kept)";
   $("limitations").innerHTML = (report.limitations || []).map((item) => `<li>${esc(item)}</li>`).join("");
   $("rawReport").textContent = JSON.stringify(report, null, 2);
+  loadCorrectedFiles(report.job_id);
+}
+
+async function loadCorrectedFiles(jobId) {
+  const panel = $("correctedFilesPanel");
+  const list = $("correctedFilesList");
+  const notice = $("importNotice");
+  if (!panel || !list) return;
+  notice.innerHTML = "";
+  try {
+    const res = await fetch(`/jobs/${jobId}/files`);
+    if (!res.ok) {
+      panel.style.display = "none";
+      return;
+    }
+    const data = await res.json();
+    const files = data.files || [];
+    if (!files.length) {
+      panel.style.display = "none";
+      return;
+    }
+    panel.style.display = "block";
+    list.innerHTML = files.map((f) => {
+      const safeId = f.file.replace(/[^a-zA-Z0-9_-]/g, "_");
+      const fns = (f.functions || []).length ? `<span class="muted" style="font-size:12px; font-weight:normal;">(${esc(f.functions.join(", "))})</span>` : "";
+      return `
+        <div class="file-item">
+          <div class="file-title">
+            <span>📄</span>
+            <span>${esc(f.file)}</span>
+            <span class="badge kept" style="font-size:10px;">${esc(f.status || "Modified")}</span>
+            ${fns}
+          </div>
+          <div class="file-actions">
+            <button class="secondary btn-sm" onclick="previewFile('${esc(jobId)}', '${esc(f.file)}')">Preview</button>
+            <button id="import-btn-${safeId}" class="btn-sm" onclick="importFile('${esc(jobId)}', '${esc(f.file)}')">Import</button>
+          </div>
+        </div>
+      `;
+    }).join("");
+  } catch (err) {
+    console.error("Failed to load corrected files", err);
+    panel.style.display = "none";
+  }
+}
+
+let currentPreviewTab = "diff";
+
+function switchPreviewTab(tab) {
+  currentPreviewTab = tab;
+  $("tabDiffBtn").classList.toggle("active", tab === "diff");
+  $("tabOptimizedBtn").classList.toggle("active", tab === "optimized");
+  $("tabOriginalBtn").classList.toggle("active", tab === "original");
+
+  $("previewDiffView").style.display = tab === "diff" ? "block" : "none";
+  $("previewOptimizedView").style.display = tab === "optimized" ? "block" : "none";
+  $("previewOriginalView").style.display = tab === "original" ? "block" : "none";
+}
+
+async function previewFile(jobId, filePath) {
+  try {
+    const res = await fetch(`/jobs/${jobId}/files/${encodeURIComponent(filePath)}/diff`);
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || "Failed to load diff preview");
+
+    $("previewModalTitle").textContent = `Diff Preview \u2014 ${data.file}`;
+    $("previewModalStats").innerHTML = `<span class="diff-added">+${data.additions} lines</span> \u00b7 <span class="diff-deleted">-${data.deletions} lines</span>`;
+    $("previewDiffView").textContent = data.diff || "(No diff lines)";
+    $("previewOptimizedView").textContent = data.optimized_content || "";
+    $("previewOriginalView").textContent = data.original_content || "";
+
+    switchPreviewTab("diff");
+    $("previewModal").style.display = "flex";
+  } catch (err) {
+    showError(err.message);
+  }
+}
+
+function closePreviewModal() {
+  $("previewModal").style.display = "none";
+}
+
+async function importFile(jobId, filePath) {
+  const safeId = filePath.replace(/[^a-zA-Z0-9_-]/g, "_");
+  const btn = $(`import-btn-${safeId}`);
+  const notice = $("importNotice");
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = "Importing...";
+  }
+  notice.innerHTML = `<span class="muted">Importing ${esc(filePath)} into original repository...</span>`;
+  try {
+    const res = await fetch(`/jobs/${jobId}/files/${encodeURIComponent(filePath)}/import`, {
+      method: "POST",
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || "Import failed");
+
+    if (btn) {
+      btn.textContent = "✓ Imported";
+      btn.classList.add("secondary");
+    }
+    notice.innerHTML = `
+      <div style="background: rgba(61,220,151,0.1); border: 1px solid rgba(61,220,151,0.3); border-radius: 8px; padding: 10px 14px; color: var(--green); font-size: 13px;">
+        <b>✓ Import successful!</b> ${esc(data.message)}<br>
+        ${data.backup_path ? `<span class="muted" style="font-size:12px;">Backup created: <span class="mono">${esc(data.backup_path)}</span></span><br>` : ""}
+        ${data.patch_path ? `<span class="muted" style="font-size:12px;">Patch created: <span class="mono">${esc(data.patch_path)}</span></span>` : ""}
+      </div>
+    `;
+  } catch (err) {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = "Import";
+    }
+    notice.innerHTML = `<div style="color:var(--red); font-size:13px;">✗ Import failed: ${esc(err.message)}</div>`;
+  }
 }
 
 $("analyzeBtn").addEventListener("click", analyze);

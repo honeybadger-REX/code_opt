@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import difflib
 import threading
 import traceback
 from datetime import datetime, timezone
@@ -15,6 +16,7 @@ from pydantic import BaseModel, Field
 
 from .agent import Agent
 from .analyzer import analyze_repository
+from .git_manager import GitError, import_verified_file
 from .jobs import JobStore
 from .tools import ToolRegistry
 
@@ -229,6 +231,127 @@ def create_app(llm: Any | None = None) -> FastAPI:
     def jobs() -> dict[str, Any]:
         return {"jobs": store.list()}
 
+    @app.get("/jobs/{job_id}/files")
+    def job_files(job_id: str) -> dict[str, Any]:
+        job = store.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail=f"Unknown job: {job_id}")
+        if job.get("status") not in {"completed", "failed", "aborted"}:
+            raise HTTPException(status_code=400, detail="Job is not completed yet")
+        report = job.get("report") or {}
+        ws_path_str = report.get("workspace")
+        if not ws_path_str:
+            return {"job_id": job_id, "files": [], "workspace": None}
+        ws_root = Path(ws_path_str)
+        if not ws_root.is_dir():
+            raise HTTPException(status_code=404, detail="Workspace directory not found")
+
+        accepted = _get_accepted_files_for_job(job)
+        file_list = []
+        for file_rel, info in accepted.items():
+            ws_file = ws_root / file_rel
+            if ws_file.is_file():
+                file_list.append(info)
+        return {
+            "job_id": job_id,
+            "workspace": str(ws_root),
+            "repo_path": job.get("repo_path"),
+            "files": file_list,
+        }
+
+    @app.get("/jobs/{job_id}/files/{file_path:path}/diff")
+    def job_file_diff(job_id: str, file_path: str) -> dict[str, Any]:
+        job = store.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail=f"Unknown job: {job_id}")
+        report = job.get("report") or {}
+        ws_path_str = report.get("workspace")
+        if not ws_path_str:
+            raise HTTPException(status_code=400, detail="Job has no workspace")
+        ws_root = Path(ws_path_str)
+        if not ws_root.is_dir():
+            raise HTTPException(status_code=404, detail="Workspace directory not found")
+
+        repo_root = Path(job.get("repo_path") or "").resolve()
+        norm_path = Path(file_path).as_posix().lstrip("/")
+        accepted = _get_accepted_files_for_job(job)
+        if norm_path not in accepted:
+            raise HTTPException(
+                status_code=403,
+                detail=f"File '{norm_path}' was not modified by an accepted optimization candidate",
+            )
+
+        ws_file = _safe_resolve_relative(ws_root, norm_path)
+        if not ws_file.is_file():
+            raise HTTPException(status_code=404, detail=f"File not found in workspace: {norm_path}")
+
+        orig_file = _safe_resolve_relative(repo_root, norm_path)
+        orig_text = orig_file.read_text(encoding="utf-8", errors="replace") if orig_file.is_file() else ""
+        opt_text = ws_file.read_text(encoding="utf-8", errors="replace")
+
+        orig_lines = orig_text.splitlines(keepends=True)
+        opt_lines = opt_text.splitlines(keepends=True)
+        diff_lines = list(
+            difflib.unified_diff(
+                orig_lines,
+                opt_lines,
+                fromfile=f"a/{norm_path}",
+                tofile=f"b/{norm_path}",
+            )
+        )
+        diff_text = "".join(diff_lines)
+        additions = sum(1 for line in diff_lines if line.startswith("+") and not line.startswith("+++"))
+        deletions = sum(1 for line in diff_lines if line.startswith("-") and not line.startswith("---"))
+
+        return {
+            "job_id": job_id,
+            "file": norm_path,
+            "status": "modified",
+            "diff": diff_text,
+            "original_content": orig_text,
+            "optimized_content": opt_text,
+            "additions": additions,
+            "deletions": deletions,
+            "functions": accepted[norm_path].get("functions", []),
+        }
+
+    @app.post("/jobs/{job_id}/files/{file_path:path}/import")
+    def job_file_import(job_id: str, file_path: str) -> dict[str, Any]:
+        job = store.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail=f"Unknown job: {job_id}")
+        if job.get("status") != "completed":
+            raise HTTPException(status_code=400, detail="Cannot import from an incomplete or failed job")
+        report = job.get("report") or {}
+        ws_path_str = report.get("workspace")
+        if not ws_path_str:
+            raise HTTPException(status_code=400, detail="Job has no workspace")
+        ws_root = Path(ws_path_str)
+        if not ws_root.is_dir():
+            raise HTTPException(status_code=404, detail="Workspace directory no longer exists on disk")
+
+        repo_root = Path(job.get("repo_path") or "").resolve()
+        if not repo_root.is_dir():
+            raise HTTPException(status_code=400, detail="Original repository directory not found")
+
+        norm_path = Path(file_path).as_posix().lstrip("/")
+        accepted = _get_accepted_files_for_job(job)
+        if norm_path not in accepted:
+            raise HTTPException(
+                status_code=403,
+                detail=f"Only accepted and verified candidates may be imported; '{norm_path}' is not eligible",
+            )
+
+        try:
+            result = import_verified_file(repo_root, ws_root, norm_path)
+            return {
+                "status": "ok",
+                "message": f"Successfully imported '{norm_path}' into original repository",
+                **result,
+            }
+        except GitError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     return app
 
 
@@ -285,6 +408,44 @@ def _report_payload(job: dict[str, Any]) -> Any:
             },
         )
     return job["report"]
+
+
+def _get_accepted_files_for_job(job: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    report = job.get("report") or {}
+    accepted: dict[str, dict[str, Any]] = {}
+    for iteration in report.get("iterations", []):
+        verification = iteration.get("verification") or {}
+        if verification.get("status") == "kept" or verification.get("action") == "KEEP":
+            finding = iteration.get("finding") or {}
+            file_rel = finding.get("file")
+            if not file_rel:
+                continue
+            norm_rel = Path(file_rel).as_posix().lstrip("/")
+            if norm_rel not in accepted:
+                accepted[norm_rel] = {
+                    "file": norm_rel,
+                    "status": "modified",
+                    "functions": [],
+                    "iterations": [],
+                }
+            fn = finding.get("function")
+            if fn and fn not in accepted[norm_rel]["functions"]:
+                accepted[norm_rel]["functions"].append(fn)
+            iter_idx = iteration.get("index")
+            if iter_idx is not None and iter_idx not in accepted[norm_rel]["iterations"]:
+                accepted[norm_rel]["iterations"].append(iter_idx)
+    return accepted
+
+
+def _safe_resolve_relative(base: Path, relative_path: str) -> Path:
+    path = Path(relative_path)
+    if path.is_absolute():
+        raise HTTPException(status_code=400, detail="Absolute paths are not allowed")
+    resolved = (base / path).resolve()
+    base_resolved = base.resolve()
+    if resolved != base_resolved and base_resolved not in resolved.parents:
+        raise HTTPException(status_code=400, detail="Path traversal detected")
+    return resolved
 
 
 app = create_app()

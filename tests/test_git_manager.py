@@ -10,6 +10,7 @@ from app.git_manager import (
     apply_to_original,
     create_workspace,
     git_available,
+    import_verified_file,
 )
 
 
@@ -104,3 +105,29 @@ def test_apply_to_original_creates_backup_and_patch(tmp_path):
 def test_create_workspace_rejects_missing_directory(tmp_path):
     with pytest.raises(GitError):
         create_workspace(tmp_path / "missing")
+
+
+def test_import_verified_file_success_and_backup(tmp_path):
+    source = tmp_path / "repo"
+    source.mkdir()
+    (source / "calc.py").write_text("x = 1\n", encoding="utf-8")
+
+    ws = tmp_path / "workspace"
+    ws.mkdir()
+    (ws / "calc.py").write_text("x = 2\n", encoding="utf-8")
+
+    result = import_verified_file(source, ws, "calc.py")
+    assert result["file"] == "calc.py"
+    assert (source / "calc.py").read_text(encoding="utf-8") == "x = 2\n"
+    assert Path(result["backup_path"]).read_text(encoding="utf-8") == "x = 1\n"
+    assert "x = 2" in Path(result["patch_path"]).read_text(encoding="utf-8")
+
+
+def test_import_verified_file_blocks_path_traversal(tmp_path):
+    source = tmp_path / "repo"
+    source.mkdir()
+    ws = tmp_path / "workspace"
+    ws.mkdir()
+
+    with pytest.raises(GitError, match="escapes"):
+        import_verified_file(source, ws, "../escape.py")

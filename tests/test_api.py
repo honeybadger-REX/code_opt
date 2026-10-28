@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 import time
 
 from fastapi.testclient import TestClient
@@ -233,3 +234,130 @@ def test_optimize_rejects_bad_path():
     client = TestClient(create_app(llm=DisabledLLM()))
     response = client.post("/optimize", json={"repo_path": "does/not/exist"})
     assert response.status_code == 400
+
+
+def test_job_files_preview_and_safe_import_flow(tmp_path, monkeypatch, sample_repo):
+    repo, _ = sample_repo
+    orig_content = (repo / "slow_mod.py").read_text(encoding="utf-8")
+    monkeypatch.setattr("app.tools.run_pytest", fake_tests)
+    app = create_app(llm=FakeLLM(OPTIMIZED))
+    client = TestClient(app)
+
+    response = client.post(
+        "/optimize",
+        json={
+            "repo_path": str(repo),
+            "max_iterations": 1,
+            "benchmark_size": 300,
+            "benchmark_repeats": 2,
+        },
+    )
+    assert response.status_code == 200
+    job_id = response.json()["job_id"]
+
+    for _ in range(150):
+        status = client.get(f"/status/{job_id}").json()
+        if status["status"] in {"completed", "failed", "aborted"}:
+            break
+        time.sleep(0.1)
+    assert status["status"] == "completed"
+
+    # 1. GET /jobs/{job_id}/files
+    files_res = client.get(f"/jobs/{job_id}/files")
+    assert files_res.status_code == 200
+    files_data = files_res.json()
+    assert files_data["job_id"] == job_id
+    assert len(files_data["files"]) == 1
+    file_info = files_data["files"][0]
+    assert file_info["file"] == "slow_mod.py"
+    assert file_info["status"] == "modified"
+    assert "find_common" in file_info["functions"]
+
+    # 2. GET /jobs/{job_id}/files/{file_path}/diff
+    diff_res = client.get(f"/jobs/{job_id}/files/slow_mod.py/diff")
+    assert diff_res.status_code == 200
+    diff_data = diff_res.json()
+    assert diff_data["file"] == "slow_mod.py"
+    assert diff_data["status"] == "modified"
+    assert diff_data["additions"] > 0
+    assert "Counter" in diff_data["optimized_content"]
+    assert "for y in b:" in diff_data["original_content"]
+    assert "-    for x in a:" in diff_data["diff"] or "+    counts = Counter(b)" in diff_data["diff"]
+
+    # Original file is NOT modified before import
+    assert (repo / "slow_mod.py").read_text(encoding="utf-8") == orig_content
+
+    # 3. POST /jobs/{job_id}/files/{file_path}/import
+    import_res = client.post(f"/jobs/{job_id}/files/slow_mod.py/import")
+    assert import_res.status_code == 200
+    import_data = import_res.json()
+    assert import_data["status"] == "ok"
+    assert "Successfully imported" in import_data["message"]
+    assert Path(import_data["backup_path"]).is_file()
+    assert Path(import_data["patch_path"]).is_file()
+
+    # Original repo is now safely updated
+    imported_content = (repo / "slow_mod.py").read_text(encoding="utf-8")
+    assert "Counter" in imported_content
+
+    # Backup contains original content
+    backup_content = Path(import_data["backup_path"]).read_text(encoding="utf-8")
+    assert backup_content == orig_content
+
+
+def test_job_files_empty_and_rejects_unaccepted_candidate(tmp_path):
+    app = create_app(llm=DisabledLLM())
+    client = TestClient(app)
+
+    # Fake a job with only a rejected candidate
+    ws_dir = tmp_path / "fake_workspace"
+    ws_dir.mkdir()
+    (ws_dir / "bad.py").write_text("def f(): pass", encoding="utf-8")
+    repo_dir = tmp_path / "fake_repo"
+    repo_dir.mkdir()
+    (repo_dir / "bad.py").write_text("def f(): return 1", encoding="utf-8")
+
+    store = app.state.store
+    job = store.create(str(repo_dir), {"max_iterations": 1})
+    job_id = job["job_id"]
+    store.start(job_id)
+    store.finish(
+        job_id,
+        {
+            "status": "completed",
+            "workspace": str(ws_dir),
+            "iterations": [
+                {
+                    "index": 1,
+                    "finding": {"file": "bad.py", "function": "f"},
+                    "verification": {"status": "rejected", "action": "REJECT"},
+                }
+            ],
+            "kept": 0,
+            "reverted": 0,
+            "rejected": 1,
+        },
+    )
+
+    # 1. /jobs/{job_id}/files should be empty
+    res = client.get(f"/jobs/{job_id}/files")
+    assert res.status_code == 200
+    assert res.json()["files"] == []
+
+    # 2. Previewing rejected candidate file should be forbidden (403)
+    diff_res = client.get(f"/jobs/{job_id}/files/bad.py/diff")
+    assert diff_res.status_code == 403
+    assert "not modified by an accepted" in diff_res.json()["detail"]
+
+    # 3. Importing rejected candidate file should be forbidden (403)
+    import_res = client.post(f"/jobs/{job_id}/files/bad.py/import")
+    assert import_res.status_code == 403
+    assert "Only accepted and verified candidates" in import_res.json()["detail"]
+
+    # 4. Path traversal should be rejected (400 or 403 or 404)
+    trav_res = client.get(f"/jobs/{job_id}/files/..%2F..%2Fetc%2Fpasswd/diff")
+    assert trav_res.status_code in {400, 403}
+
+    # 5. Non-existent job (404)
+    missing_res = client.get("/jobs/nonexistent123/files")
+    assert missing_res.status_code == 404

@@ -306,3 +306,63 @@ def apply_to_original(workspace: Workspace, files: list[str]) -> dict[str, objec
         "backup_dir": str(backup_dir) if copied else None,
         "patch_path": str(patch_path),
     }
+
+
+def import_verified_file(
+    source_root: Path,
+    workspace_root: Path,
+    relative_path: str,
+) -> dict[str, Any]:
+    """Safely copy a single verified file from workspace to source repo with backup."""
+    source_root = Path(source_root).resolve()
+    workspace_root = Path(workspace_root).resolve()
+
+    norm_rel = Path(relative_path).as_posix().lstrip("/")
+    source_file = (source_root / norm_rel).resolve()
+    workspace_file = (workspace_root / norm_rel).resolve()
+
+    if source_root not in source_file.parents and source_file != source_root:
+        raise GitError(f"Target file escapes source repository: {relative_path}")
+    if workspace_root not in workspace_file.parents and workspace_file != workspace_root:
+        raise GitError(f"Workspace file escapes workspace directory: {relative_path}")
+
+    if not workspace_file.is_file():
+        raise GitError(f"File not found in isolated workspace: {relative_path}")
+
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    state_dir = source_root / ".codeoptimizer"
+    backup_dir = state_dir / "backups" / stamp
+    patch_dir = state_dir / "patches"
+
+    backup_file = None
+    old_lines: list[str] = []
+    if source_file.exists():
+        backup_file = backup_dir / norm_rel
+        backup_file.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source_file, backup_file)
+        old_lines = backup_file.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
+
+    source_file.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(workspace_file, source_file)
+    new_lines = source_file.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
+
+    diff = "".join(
+        difflib.unified_diff(
+            old_lines,
+            new_lines,
+            fromfile=f"a/{norm_rel}",
+            tofile=f"b/{norm_rel}",
+        )
+    )
+
+    safe_name = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in norm_rel)
+    patch_path = patch_dir / f"{stamp}_{safe_name}.patch"
+    patch_dir.mkdir(parents=True, exist_ok=True)
+    patch_path.write_text(diff, encoding="utf-8")
+
+    return {
+        "file": norm_rel,
+        "backup_dir": str(backup_dir) if backup_file else None,
+        "backup_path": str(backup_file) if backup_file else None,
+        "patch_path": str(patch_path),
+    }
