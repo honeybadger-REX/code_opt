@@ -1,0 +1,7 @@
+{
+  "benchmark": {
+    "size": 2500,
+    "repeats": 3,
+    "min_improvement_pct": 5
+  }
+}
